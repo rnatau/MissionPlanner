@@ -1,5 +1,6 @@
 ﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Emit;
 using Microsoft.CSharp;
 using MissionPlanner.Utilities;
 using System;
@@ -9,10 +10,12 @@ using System.Collections;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
-using Org.BouncyCastle.Crypto.Digests;
 
 namespace MissionPlanner
 {
@@ -38,24 +41,8 @@ namespace MissionPlanner
             {
             }
 
-            var md5hash = "";
             lasterror = "";
             var filecontents = File.ReadAllText(filepath, Encoding.UTF8);
-            {
-                var bytes = (filecontents + BuildId).Select(a => (byte) a).ToArray();
-                var md5 = new MD5Digest();
-                md5.BlockUpdate(bytes, 0, bytes.Length);
-                var result = new byte[md5.GetDigestSize()];
-                md5.DoFinal(result, 0);
-                md5hash = BitConverter.ToString(result).Replace("-", "").ToLower();
-
-                if (File.Exists(Path.Combine(CachePath, md5hash + ".dll")) && File.Exists(Path.Combine(CachePath, md5hash + ".pdb")))
-                {
-                    // load the cached version
-                    return Assembly.Load(File.ReadAllBytes(Path.Combine(CachePath, md5hash + ".dll")),
-                        File.ReadAllBytes(Path.Combine(CachePath, md5hash + ".pdb")));
-                }
-            }
             var syntaxTree =
                 CSharpSyntaxTree.ParseText(filecontents, path: filepath,
                     encoding: Encoding.UTF8);
@@ -64,16 +51,31 @@ namespace MissionPlanner
             var refs = AppDomain.CurrentDomain.GetAssemblies();
             var refFiles = refs.Where(a =>
                     !a.IsDynamic && !a.FullName.Contains("MissionPlanner.Drawing"))
-                .Select(a => a.Location);
+                .Where(a => !string.IsNullOrEmpty(a.Location) && File.Exists(a.Location)).ToArray();
             if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-                refFiles = refs.Where(a => !a.IsDynamic).Select(a => a.Location);
+                refFiles = refs.Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location) && File.Exists(a.Location)).ToArray();
+
+            // Include the host build, source location and referenced module identities:
+            // rebuild when the host/API or debug document changes, even when the
+            // entry assembly has no file location and is absent from refFiles.
+            // The format version also retires the old, unvalidated DLL/PDB pairs.
+            var cacheIdentity = "embedded-pdb-v1\n" + BuildId + "\n" + Path.GetFullPath(filepath) + "\n" + filecontents + "\n" +
+                string.Join("\n", refFiles.Select(a => a.Location + "|" + a.ManifestModule.ModuleVersionId)
+                    .OrderBy(a => a, StringComparer.Ordinal));
+            string cacheFile;
+            using (var hash = SHA256.Create())
+                cacheFile = Path.Combine(CachePath, BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(cacheIdentity)))
+                    .Replace("-", "").ToLowerInvariant() + ".dll");
+
+            var cached = LoadCachedAssembly(cacheFile);
+            if (cached != null)
+                return cached;
+
             var refmeta = refFiles.Select(a =>
             {
                 try
                 {
-                    if (a == "" || !File.Exists(a))
-                        return null;
-                    return AssemblyMetadata.CreateFromFile(a).GetReference();
+                    return AssemblyMetadata.CreateFromFile(a.Location);
                 }
                 catch
                 {
@@ -81,36 +83,107 @@ namespace MissionPlanner
                 }
             }).Where(a => a != null).ToArray();
 
-            CSharpCompilation compilation = CSharpCompilation.Create(
-                assemblyName,
-                new[] {syntaxTree}, refmeta,
-                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
-
-            using (var dllStream = new MemoryStream())
-            using (var pdbStream = new MemoryStream())
+            try
             {
-                var emitResult = compilation.Emit(dllStream, pdbStream);
-                if (!emitResult.Success)
+                CSharpCompilation compilation = CSharpCompilation.Create(
+                    assemblyName,
+                    new[] {syntaxTree}, refmeta.Select(a => a.GetReference()),
+                    new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+
+                using (var dllStream = new MemoryStream())
                 {
-                    // emitResult.Diagnostics
-                    emitResult.Diagnostics.ForEach(a => Console.WriteLine("CodeGenRoslyn " + Path.GetFileName(filepath) + ": {0}", a.ToString()));
-                    lasterror = emitResult.Diagnostics.Aggregate("", (a, b) => a + b.ToString()+"\n");
-                }
-                else
-                {
-                    try
+                    // Keep IL and symbols in one artifact. Publishing separate files
+                    // allows concurrent compilers/readers to observe a torn pair.
+                    var emitResult = compilation.Emit(dllStream,
+                        options: new EmitOptions(debugInformationFormat: DebugInformationFormat.Embedded));
+                    if (!emitResult.Success)
                     {
-                        File.WriteAllBytes(Path.Combine(CachePath, md5hash + ".dll"), dllStream.ToArray());
-                        File.WriteAllBytes(Path.Combine(CachePath, md5hash + ".pdb"), pdbStream.ToArray());
+                        emitResult.Diagnostics.ForEach(a => Console.WriteLine("CodeGenRoslyn " + Path.GetFileName(filepath) + ": {0}", a.ToString()));
+                        lasterror = emitResult.Diagnostics.Aggregate("", (a, b) => a + b.ToString()+"\n");
                     }
-                    catch
+                    else
                     {
+                        var bytes = dllStream.ToArray();
+                        PublishCache(cacheFile, bytes);
+                        return Assembly.Load(bytes);
                     }
 
-                    return Assembly.Load(dllStream.ToArray(), pdbStream.ToArray());
+                    return null;
                 }
+            }
+            finally
+            {
+                // The compilation owns these file-backed metadata mappings only
+                // until emit finishes, including failed and concurrent builds.
+                foreach (var metadata in refmeta) metadata.Dispose();
+            }
+        }
 
+        private static Assembly LoadCachedAssembly(string filename)
+        {
+            if (!File.Exists(filename))
                 return null;
+            try
+            {
+                var bytes = File.ReadAllBytes(filename);
+                using (var pe = new PEReader(new MemoryStream(bytes, false)))
+                {
+                    pe.GetMetadataReader();
+                    var entries = pe.ReadDebugDirectory();
+                    var embedded = entries.FirstOrDefault(a => a.Type == DebugDirectoryEntryType.EmbeddedPortablePdb);
+                    if (embedded.Type != DebugDirectoryEntryType.EmbeddedPortablePdb)
+                        return null;
+                    using (var provider = pe.ReadEmbeddedPortablePdbDebugDirectoryData(embedded))
+                    {
+                        var pdb = provider.GetMetadataReader();
+                        var id = new BlobContentId(pdb.DebugMetadataHeader.Id);
+                        if (!entries.Any(a => a.Type == DebugDirectoryEntryType.CodeView &&
+                            pe.ReadCodeViewDebugDirectoryData(a).Guid == id.Guid && a.Stamp == id.Stamp))
+                            return null;
+
+                        // These tables are decoded lazily. Validate the locations
+                        // before handing symbols to Mono, whose native reader can
+                        // abort the process rather than throw on malformed metadata.
+                        foreach (var document in pdb.Documents)
+                            pdb.GetString(pdb.GetDocument(document).Name);
+                        foreach (var method in pdb.MethodDebugInformation)
+                            foreach (var point in pdb.GetMethodDebugInformation(method).GetSequencePoints())
+                                pdb.GetDocument(point.Document);
+                    }
+                }
+                return Assembly.Load(bytes);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException ||
+                                       ex is BadImageFormatException || ex is InvalidOperationException ||
+                                       ex is ArgumentException)
+            {
+                Console.WriteLine("CodeGenRoslyn: rebuilding invalid cache {0}: {1}", filename, ex.Message);
+                return null;
+            }
+        }
+
+        private static void PublishCache(string filename, byte[] bytes)
+        {
+            var temporary = filename + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                File.WriteAllBytes(temporary, bytes);
+                // A reader sees a complete old or new assembly. No shared lock is
+                // needed, including between separate Mission Planner processes.
+                if (File.Exists(filename))
+                    File.Replace(temporary, filename, null);
+                else
+                    File.Move(temporary, filename);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is NotSupportedException)
+            {
+                // Caching is optional; a competing publisher may have won the race.
+            }
+            finally
+            {
+                try { File.Delete(temporary); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
             }
         }
     }
